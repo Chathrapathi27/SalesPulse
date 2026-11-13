@@ -1,25 +1,23 @@
-venv/
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-mlruns/
-.env
-.DS_Store
-
-# Environment
-.venv/
-venv/
-.env
-
 # Python
+venv/
 __pycache__/
-*.pyc
-
-# Testing
+*.py[cod]
 .pytest_cache/
 
-# Raw datasets
-data/raw/
+# Environment
+.env
 
-# Jupyter
+# Large M5 datasets
+data/raw/
+data/processed/
+data/user_datasets/
+
+# Model tracking
+mlruns/
+mlflow.db
+mlflow.db-shm
+mlflow.db-wal
+
+# Generated files
 .ipynb_checkpoints/
+.DS_Store
