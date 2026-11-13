@@ -1,4 +1,3 @@
-
 import gc
 import json
 import joblib
@@ -22,15 +21,10 @@ def load_best_model():
     with open(metadata_path, "r", encoding="utf-8") as file:
         metadata = json.load(file)
 
-    best_model = (
-        metadata.get("best_model")
-        or metadata.get("model_name")
-    )
+    best_model = metadata.get("best_model") or metadata.get("model_name")
 
     if not best_model:
-        raise ValueError(
-            "best_model.json does not contain a model name."
-        )
+        raise ValueError("best_model.json does not contain a model name.")
 
     model_mapping = {
         "Random Forest": "random_forest",
@@ -46,21 +40,19 @@ def load_best_model():
     model_path = MODEL_DIR / f"{model_name}.joblib"
 
     if not model_path.exists():
-        raise FileNotFoundError(
-            f"Model file not found: {model_path}"
-        )
+        raise FileNotFoundError(f"Model file not found: {model_path}")
 
     print(f"Loading model: {model_name}")
 
-    model = joblib.load(model_path)
-
-    return model, model_name
+    return joblib.load(model_path), model_name
 
 
-def load_latest_features_batch():
+def load_latest_features_batch(feature_columns):
     """
-    Read feature files one at a time and retain the latest
-    record for every original product-store series.
+    Read only the columns required for prediction.
+
+    Each Parquet file contains different product-store series
+    across the full historical date range.
     """
 
     files = sorted(FEATURE_DIR.glob("*.parquet"))
@@ -70,38 +62,55 @@ def load_latest_features_batch():
             f"No Parquet files found in {FEATURE_DIR}"
         )
 
+    required_columns = list(dict.fromkeys(
+        ["id", "date", "sales"] + list(feature_columns)
+    ))
+
     latest_batches = []
 
     print(f"Found {len(files)} feature files.")
-    print("Collecting latest product-store records...")
+    print("Reading only required prediction columns...")
 
     for index, file in enumerate(files, start=1):
-
         print(f"Processing {index}/{len(files)}: {file.name}")
 
-        batch = pd.read_parquet(file)
+        try:
+            batch = pd.read_parquet(
+                file,
+                columns=required_columns
+            )
+        except Exception as error:
+            raise ValueError(
+                f"Could not read required columns from {file.name}: {error}"
+            ) from error
 
         batch["date"] = pd.to_datetime(
             batch["date"],
             errors="coerce"
         )
 
-        batch = batch.dropna(subset=["date"])
+        batch = batch.dropna(subset=["id", "date"])
 
-        batch = batch.sort_values("date")
+        if batch.empty:
+            del batch
+            continue
 
-        latest = (
-            batch.groupby("id", sort=False)
-            .tail(1)
-            .copy()
+        # Select the most recent observation for each product series.
+        latest_indices = (
+            batch.groupby("id", sort=False)["date"].idxmax()
         )
+
+        latest = batch.loc[latest_indices].copy()
 
         latest_batches.append(latest)
 
-        del batch
-        del latest
+        del batch, latest, latest_indices
 
-        gc.collect()
+        if index % 10 == 0:
+            gc.collect()
+
+    if not latest_batches:
+        raise ValueError("No valid product records were found.")
 
     result = pd.concat(
         latest_batches,
@@ -111,44 +120,44 @@ def load_latest_features_batch():
     del latest_batches
     gc.collect()
 
-    print(f"Latest records collected: {len(result):,}")
+    # Each product-store series should belong to exactly one file.
+    duplicate_ids = result["id"].duplicated()
+
+    if duplicate_ids.any():
+        examples = result.loc[duplicate_ids, "id"].head(5).tolist()
+
+        raise ValueError(
+            "Duplicate product series found across feature files. "
+            f"Examples: {examples}"
+        )
+
+    print(f"Latest product records collected: {len(result):,}")
 
     return result
 
 
 def predict_sales():
-    """Generate sales predictions for all product-store series."""
+    """Generate one-step-ahead predictions for all product-store series."""
 
     model, model_name = load_best_model()
 
-    latest = load_latest_features_batch()
+    if not hasattr(model, "feature_names_in_"):
+        raise ValueError(
+            "The selected model does not expose feature_names_in_. "
+            "Please check the saved model."
+        )
 
-    excluded_columns = {
-        "id",
-        "date",
-        "sales",
-    }
+    feature_columns = list(model.feature_names_in_)
 
-    # Use the exact training feature order when available.
-    if hasattr(model, "feature_names_in_"):
-        feature_columns = list(model.feature_names_in_)
-    else:
-        feature_columns = [
-            column
-            for column in latest.columns
-            if column not in excluded_columns
-        ]
+    latest = load_latest_features_batch(feature_columns)
 
     missing_columns = [
-        column
-        for column in feature_columns
+        column for column in feature_columns
         if column not in latest.columns
     ]
 
     if missing_columns:
-        raise ValueError(
-            f"Missing model features: {missing_columns}"
-        )
+        raise ValueError(f"Missing model features: {missing_columns}")
 
     X = latest[feature_columns]
 
@@ -156,30 +165,26 @@ def predict_sales():
 
     predictions = model.predict(X)
 
-    results = latest[
-        ["id", "date", "sales"]
-    ].copy()
+    results = latest[["id", "date", "sales"]].copy()
 
-    # Preserve the original M5 ID for traceability.
+    # Preserve original M5 IDs for traceability.
     results["source_id"] = results["id"]
 
-    # Remove the dataset split suffix for cleaner display.
+    # Remove the evaluation suffix for dashboard display.
     results["id"] = (
         results["id"]
         .astype(str)
         .str.replace(r"_evaluation$", "", regex=True)
     )
 
-    # Ensure predictions are non-negative.
     results["predicted_sales"] = (
-        pd.Series(predictions)
+        pd.Series(predictions, index=results.index)
         .clip(lower=0)
         .to_numpy()
     )
 
     results["model_name"] = model_name
 
-    # Display dates consistently as YYYY-MM-DD.
     results["date"] = (
         pd.to_datetime(results["date"])
         .dt.strftime("%Y-%m-%d")
@@ -193,11 +198,7 @@ def predict_sales():
 
 
 if __name__ == "__main__":
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Starting SalesPulse predictions...")
 
@@ -205,10 +206,7 @@ if __name__ == "__main__":
 
     output_file = OUTPUT_DIR / "latest_predictions.csv"
 
-    predictions.to_csv(
-        output_file,
-        index=False
-    )
+    predictions.to_csv(output_file, index=False)
 
     print("\nPrediction completed successfully.")
     print(f"Total predictions: {len(predictions):,}")

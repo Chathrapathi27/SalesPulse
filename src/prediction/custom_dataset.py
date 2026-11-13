@@ -356,6 +356,90 @@ def generate_predictions(dataframe, model_name):
     return pd.DataFrame(prediction_rows)
 
 
+
+# ============================================================
+# RECURSIVE 28-DAY HOLDOUT EVALUATION
+# ============================================================
+
+EVALUATION_HISTORY_DAYS = MIN_HISTORY_DAYS + 28
+
+
+def evaluate_dataset_28day(dataframe, model_name):
+    """Run a leakage-free recursive 28-day holdout for every product."""
+    df = validate_dataset(dataframe)
+    short = [(str(pid), len(g)) for pid, g in df.groupby("id", sort=False)
+             if len(g) < EVALUATION_HISTORY_DAYS]
+    if short:
+        examples = ", ".join(f"{pid} ({n} days)" for pid, n in short[:5])
+        return {"available": False, "reason": (
+            "28-day evaluation requires at least 57 consecutive daily observations "
+            f"for every product. {len(short)} series are too short. Examples: {examples}."),
+            "summary": pd.DataFrame(), "daily_metrics": pd.DataFrame(),
+            "predictions": pd.DataFrame()}
+
+    model, model_key = load_model(model_name)
+    feature_columns = list(model.feature_names_in_)
+    records = []
+    for pid, group in df.groupby("id", sort=False):
+        group = group.sort_values("date").reset_index(drop=True)
+        history = group.iloc[:-28][["id", "date", "sales"]].copy()
+        holdout = group.iloc[-28:].reset_index(drop=True)
+        for day, actual_row in enumerate(holdout.itertuples(index=False), 1):
+            X, forecast_date = _make_feature_row(history, feature_columns)
+            predicted = max(0.0, float(model.predict(X)[0]))
+            records.append({"id": str(pid), "date": pd.Timestamp(actual_row.date),
+                            "forecast_day": day, "actual_sales": float(actual_row.sales),
+                            "predicted_sales": predicted, "model": model_key})
+            # Critical: append forecast, never holdout actual, to avoid leakage.
+            history = pd.concat([history, pd.DataFrame([{
+                "id": str(pid), "date": forecast_date, "sales": predicted}])],
+                ignore_index=True)
+
+    pred = pd.DataFrame(records)
+    err = pred.predicted_sales - pred.actual_sales
+    ae = err.abs()
+    nz = pred.actual_sales != 0
+    actual_total = float(pred.actual_sales.sum())
+    summary = pd.DataFrame([{
+        "model": model_key, "MAE": float(ae.mean()),
+        "RMSE": float(np.sqrt(np.mean(np.square(err)))),
+        "MAPE_nonzero_percent": float((ae[nz] / pred.loc[nz, "actual_sales"].abs()).mean() * 100) if nz.any() else None,
+        "WAPE_percent": float(ae.sum() / actual_total * 100) if actual_total > 0 else None,
+        "forecast_days": 28, "product_series": int(pred.id.nunique()),
+        "forecast_records": int(len(pred))}])
+    daily_rows = []
+    for day, part in pred.groupby("forecast_day"):
+        e = part.predicted_sales - part.actual_sales
+        a = e.abs()
+        nz_day = part.actual_sales != 0
+        total = float(part.actual_sales.sum())
+        daily_rows.append({"forecast_day": int(day), "date": part.date.min(),
+            "model": model_key, "MAE": float(a.mean()),
+            "RMSE": float(np.sqrt(np.mean(np.square(e)))),
+            "MAPE_nonzero_percent": float((a[nz_day] / part.loc[nz_day, "actual_sales"].abs()).mean() * 100) if nz_day.any() else None,
+            "WAPE_percent": float(a.sum() / total * 100) if total > 0 else None})
+    return {"available": True, "reason": None, "summary": summary,
+            "daily_metrics": pd.DataFrame(daily_rows), "predictions": pred}
+
+
+def get_dataset_evaluation(dataset_id):
+    """Read the persisted evaluation summary and CSV artifacts."""
+    if not re.fullmatch(r"[a-f0-9]{12}", str(dataset_id)):
+        raise ValueError("Invalid dataset ID.")
+    folder = DATASET_DIR / dataset_id
+    path = folder / "evaluation_summary.json"
+    if not path.is_file():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        info = json.load(f)
+    if not info.get("available"):
+        return info
+    return {**info,
+        "summary": pd.DataFrame([info["metrics"]]),
+        "daily_metrics": pd.read_csv(folder / "evaluation_daily_metrics.csv", parse_dates=["date"]),
+        "predictions": pd.read_csv(folder / "evaluation_predictions.csv", parse_dates=["date"])}
+
+
 def save_dataset(filename, dataframe, model_name):
     """Validate, predict, and save an uploaded dataset."""
 
@@ -389,6 +473,16 @@ def save_dataset(filename, dataframe, model_name):
             index=False
         )
 
+        evaluation = evaluate_dataset_28day(dataframe, model_name)
+        evaluation_info = {"available": bool(evaluation["available"]),
+                           "reason": evaluation.get("reason")}
+        if evaluation["available"]:
+            evaluation_info["metrics"] = evaluation["summary"].iloc[0].to_dict()
+            evaluation["daily_metrics"].to_csv(dataset_folder / "evaluation_daily_metrics.csv", index=False)
+            evaluation["predictions"].to_csv(dataset_folder / "evaluation_predictions.csv", index=False)
+        with open(dataset_folder / "evaluation_summary.json", "w", encoding="utf-8") as f:
+            json.dump(evaluation_info, f, indent=4, default=str)
+
         metadata = {
             "dataset_id": dataset_id,
             "filename": safe_filename,
@@ -397,6 +491,8 @@ def save_dataset(filename, dataframe, model_name):
             "products": int(dataframe["id"].nunique()),
             "forecast_rows": int(len(predictions)),
             "uploaded_at": pd.Timestamp.now().isoformat(),
+            "evaluation_28day_available": bool(evaluation["available"]),
+            "evaluation_28day_reason": evaluation.get("reason"),
         }
 
         with open(

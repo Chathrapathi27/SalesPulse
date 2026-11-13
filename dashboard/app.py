@@ -60,13 +60,27 @@ footer, #MainMenu {
 
 .block-container {
     max-width: 1500px;
-    padding-top: 2rem;
-    padding-bottom: 3rem;
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
 }
 
 section[data-testid="stSidebar"] {
     background: #111827;
     border-right: 1px solid #263247;
+}
+section[data-testid="stSidebar"] .block-container {
+    padding-top: 1.2rem;
+    padding-bottom: 1rem;
+}
+section[data-testid="stSidebar"] [role="radiogroup"] {
+    gap: 0.35rem;
+}
+section[data-testid="stSidebar"] [role="radiogroup"] label {
+    padding: 0.35rem 0.5rem;
+    border-radius: 8px;
+}
+section[data-testid="stSidebar"] [role="radiogroup"] label:hover {
+    background: #1e293b;
 }
 
 section[data-testid="stSidebar"] * {
@@ -252,6 +266,39 @@ def load_model_metrics():
     return pd.DataFrame(response.json()["model_metrics"])
 
 
+@st.cache_data(ttl=60)
+def load_28day_evaluation():
+    results_dir = (
+        BASE_DIR / "data" / "processed" / "model_results"
+    )
+
+    summary_file = results_dir / "recursive_28day_summary.csv"
+    daily_file = results_dir / "recursive_28day_daily_metrics.csv"
+    predictions_file = results_dir / "recursive_28day_predictions.csv"
+
+    required_files = [
+        summary_file,
+        daily_file,
+        predictions_file,
+    ]
+
+    missing = [str(path) for path in required_files if not path.exists()]
+
+    if missing:
+        raise FileNotFoundError(
+            "Missing 28-day evaluation files: " + ", ".join(missing)
+        )
+
+    summary = pd.read_csv(summary_file)
+    daily = pd.read_csv(daily_file)
+    predictions = pd.read_csv(predictions_file)
+
+    daily["date"] = pd.to_datetime(daily["date"])
+    predictions["date"] = pd.to_datetime(predictions["date"])
+
+    return summary, daily, predictions
+
+
 @st.cache_data(ttl=15)
 def check_api():
     response = requests.get(
@@ -303,18 +350,19 @@ st.markdown("""
 # MAIN DASHBOARD TABS
 # ============================================================
 
-m5_tab, upload_tab, manage_tab = st.tabs([
-    "📈 M5 Dashboard",
-    "📤 Upload & Predict",
-    "🗂️ Manage Datasets",
-])
+page = st.sidebar.radio(
+    "NAVIGATION",
+    ["Overview", "M5 Forecasts", "Forecast Evaluation", "Upload & Predict",
+     "My Datasets", "Model Comparison", "About & Settings"],
+    key="main_navigation",
+)
 
 
 # ============================================================
 # TAB 1 — ORIGINAL M5 DASHBOARD
 # ============================================================
 
-with m5_tab:
+if page == "M5 Forecasts":
 
     st.subheader("M5 Model Predictions")
 
@@ -570,7 +618,188 @@ with m5_tab:
 # TAB 2 — UPLOAD AND PREDICT
 # ============================================================
 
-with upload_tab:
+
+
+
+if page == "Forecast Evaluation":
+    # ========================================================
+    # 28-DAY RECURSIVE FORECAST EVALUATION
+    # ========================================================
+
+    st.markdown("---")
+    st.subheader("28-Day Recursive Forecast Evaluation")
+
+    st.caption(
+        "Out-of-sample evaluation from April 25 to May 22, 2016. "
+        "Forecasts are generated recursively over 28 days."
+    )
+
+    try:
+        summary_28, daily_28, predictions_28 = (
+            load_28day_evaluation()
+        )
+
+        best_model = summary_28.sort_values(
+            "RMSE"
+        ).iloc[0]
+
+        k1, k2, k3, k4 = st.columns(4)
+
+        k1.metric(
+            "Best Model (RMSE)",
+            best_model["model"],
+        )
+
+        k2.metric(
+            "Best RMSE",
+            f"{best_model['RMSE']:.3f}",
+        )
+
+        k3.metric(
+            "Forecast Horizon",
+            f"{int(best_model['forecast_days'])} days",
+        )
+
+        k4.metric(
+            "Product-Store Series",
+            f"{int(best_model['product_series']):,}",
+        )
+
+        st.markdown("#### Overall Model Comparison")
+
+        st.dataframe(
+            summary_28.sort_values("RMSE"),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        metric_options = {
+            "MAE": "MAE",
+            "RMSE": "RMSE",
+            "MAPE (%)": "MAPE_nonzero_percent",
+            "WAPE (%)": "WAPE_percent",
+        }
+
+        selected_28_metric = st.selectbox(
+            "Compare models using",
+            options=list(metric_options.keys()),
+            key="recursive_28day_metric",
+        )
+
+        metric_column = metric_options[selected_28_metric]
+
+        comparison_28 = summary_28.sort_values(
+            metric_column
+        )
+
+        fig = px.bar(
+            comparison_28,
+            x="model",
+            y=metric_column,
+            color="model",
+            text=metric_column,
+            title=f"28-Day Model Comparison — {selected_28_metric}",
+        )
+
+        fig.update_traces(
+            texttemplate="%{text:.3f}",
+            textposition="outside",
+        )
+
+        st.plotly_chart(
+            style_chart(fig, 380),
+            use_container_width=True,
+        )
+
+        st.markdown("#### Forecast Accuracy by Day")
+
+        selected_28_model = st.selectbox(
+            "Select model",
+            options=sorted(daily_28["model"].unique()),
+            key="recursive_28day_model",
+        )
+
+        selected_daily = daily_28[
+            daily_28["model"] == selected_28_model
+        ].sort_values("forecast_day")
+
+        fig = px.line(
+            selected_daily,
+            x="forecast_day",
+            y="MAE",
+            markers=True,
+            title=f"Daily MAE — {selected_28_model}",
+            labels={
+                "forecast_day": "Forecast Day",
+                "MAE": "Mean Absolute Error",
+            },
+        )
+
+        st.plotly_chart(
+            style_chart(fig, 350),
+            use_container_width=True,
+        )
+
+        st.markdown("#### Actual vs Predicted Sales")
+
+        available_products = sorted(
+            predictions_28["id"].unique()
+        )
+
+        selected_28_product = st.selectbox(
+            "Select product-store series",
+            options=available_products,
+            key="recursive_28day_product",
+        )
+
+        product_model_data = predictions_28[
+            (predictions_28["id"] == selected_28_product)
+            & (predictions_28["model"] == selected_28_model)
+        ].sort_values("forecast_day")
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=product_model_data["date"],
+            y=product_model_data["actual_sales"],
+            mode="lines+markers",
+            name="Actual Sales",
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=product_model_data["date"],
+            y=product_model_data["predicted_sales"],
+            mode="lines+markers",
+            name="Predicted Sales",
+        ))
+
+        fig.update_layout(
+            title=f"28-Day Forecast — {selected_28_product}",
+            xaxis_title="Forecast Date",
+            yaxis_title="Sales Units",
+        )
+
+        st.plotly_chart(
+            style_chart(fig, 380),
+            use_container_width=True,
+        )
+
+        st.download_button(
+            "Download 28-Day Evaluation Results",
+            data=predictions_28.to_csv(
+                index=False
+            ).encode("utf-8"),
+            file_name="salespulse_28day_predictions.csv",
+            mime="text/csv",
+            key="download_28day_results",
+        )
+
+    except Exception as error:
+        st.warning(
+            f"28-day evaluation data could not be loaded: {error}"
+        )
+
+if page == "Upload & Predict":
 
     st.subheader("Upload Your Retail Sales Dataset")
 
@@ -708,7 +937,7 @@ with upload_tab:
 # TAB 3 — MANAGE UPLOADED DATASETS
 # ============================================================
 
-with manage_tab:
+if page == "My Datasets":
 
     st.subheader("Uploaded Dataset Library")
 
@@ -854,6 +1083,88 @@ with manage_tab:
             )
 
 
+if page == "Overview":
+    st.markdown("## SalesPulse Overview")
+    st.markdown(
+        "A retail demand intelligence workspace for exploring historical sales, "
+        "comparing machine-learning models, and generating product-level forecasts."
+    )
+
+    api_ok = False
+    forecast_count = "—"
+    model_count = "—"
+    try:
+        health = check_api()
+        api_ok = health.get("status") == "healthy"
+        overview_predictions = load_m5_predictions()
+        forecast_count = f"{len(overview_predictions):,}"
+        overview_metrics = load_model_metrics()
+        model_col = next(
+            (c for c in overview_metrics.columns
+             if c.lower() in ["model", "model_name", "name"]),
+            None,
+        )
+        model_count = (
+            f"{overview_metrics[model_col].nunique():,}"
+            if model_col else f"{len(overview_metrics):,}"
+        )
+    except Exception:
+        pass
+
+    st.markdown('<div class="section-heading">Platform at a glance</div>',
+                unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    show_kpi(c1, "API STATUS", "Online" if api_ok else "Offline",
+             "FastAPI prediction service")
+    show_kpi(c2, "M5 FORECASTS", forecast_count,
+             "Available prediction records")
+    show_kpi(c3, "TRAINED MODELS", model_count,
+             "Models available for comparison")
+    show_kpi(c4, "FORECAST HORIZON", "1–28 days",
+             "Next-day and recursive evaluation")
+
+    st.markdown('<div class="section-heading">Explore SalesPulse</div>',
+                unsafe_allow_html=True)
+    cards = st.columns(3)
+    destinations = [
+        ("M5 Forecasts", "Explore product-store predictions and forecast totals."),
+        ("Forecast Evaluation", "Compare recursive 28-day model performance."),
+        ("Upload & Predict", "Upload a CSV and generate next-day predictions."),
+        ("My Datasets", "Review, download, or delete saved datasets."),
+        ("Model Comparison", "Compare model error metrics side by side."),
+        ("About & Settings", "Review project details and data requirements."),
+    ]
+    for index, (heading, description) in enumerate(destinations):
+        with cards[index % 3]:
+            st.markdown(
+                f"""<div class="kpi-card" style="min-height:112px;margin-bottom:14px;">
+                    <div style="font-size:16px;font-weight:700;color:#f8fafc;">{heading}</div>
+                    <div style="font-size:13px;color:#94a3b8;margin-top:9px;">{description}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+
+if page == "Model Comparison":
+    st.subheader("Model Comparison")
+    try:
+        comparison_metrics = load_model_metrics()
+        st.dataframe(comparison_metrics, use_container_width=True, hide_index=True)
+        numeric = [c for c in comparison_metrics.select_dtypes(include="number").columns if c.lower() in ["mae", "rmse", "mape", "wape", "mape_nonzero_percent", "wape_percent"]]
+        model_col = next((c for c in comparison_metrics.columns if c.lower() in ["model", "model_name", "name"]), None)
+        if numeric and model_col:
+            metric_choice = st.selectbox("Evaluation metric", numeric, key="sidebar_model_metric")
+            fig = px.bar(comparison_metrics.sort_values(metric_choice), x=metric_choice, y=model_col, orientation="h", title=f"Model comparison — {metric_choice}")
+            st.plotly_chart(style_chart(fig, 350), use_container_width=True)
+    except Exception as error:
+        st.warning(f"Model comparison is unavailable: {error}")
+
+if page == "About & Settings":
+    st.subheader("About & Settings")
+    st.write("SalesPulse is a CSCE 5210 retail sales forecasting prototype.")
+    st.markdown("**Stack:** Python, Pandas, NumPy, Scikit-learn, FastAPI, Streamlit, Plotly, and Joblib.\n\n**Custom CSV format:** `id`, `date`, `sales`.\n\n**Custom 28-day evaluation:** requires at least 57 consecutive observations per product and recursively feeds predictions into subsequent forecast steps.")
+
+
 # ============================================================
 # FOOTER
 # ============================================================
@@ -867,3 +1178,4 @@ st.markdown("""
     Prototype version
 </div>
 """, unsafe_allow_html=True)
+
