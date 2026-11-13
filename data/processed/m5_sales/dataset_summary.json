@@ -1,0 +1,10 @@
+{
+    "dataset": "M5 Forecasting Accuracy",
+    "source_file": "sales_train_evaluation.csv",
+    "product_store_combinations": 30490,
+    "daily_observations": 1941,
+    "total_records": 59181090,
+    "total_sales": 66927173.0,
+    "chunks_created": 122,
+    "output_format": "Parquet"
+}

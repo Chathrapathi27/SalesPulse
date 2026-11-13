@@ -1,0 +1,6 @@
+{
+    "best_model": "Random Forest",
+    "best_rmse": 2.5862699188380396,
+    "validation_days": 28,
+    "sample_limit": 100
+}
